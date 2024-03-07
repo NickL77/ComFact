@@ -53,12 +53,14 @@ from .utils.model import (
 
 from .utils.data import write_generation_preds, write_linking_preds
 
-
 try:
     from torch.utils.tensorboard import SummaryWriter
 except ImportError:
     from tensorboardX import SummaryWriter
 
+import wandb
+
+from torch.cuda.amp import autocast, GradScaler
 
 logger = logging.getLogger(__name__)
 rank_to_device = {0: 0, 1: 1, 2: 2, 3: 3}
@@ -104,7 +106,7 @@ def train(args, train_dataset, eval_dataset, model: PreTrainedModel, tokenizer: 
 
     t_total = len(train_dataloader) // args.gradient_accumulation_steps * args.num_train_epochs
 
-    optimizer = AdamW(model.parameters(), lr=args.learning_rate, eps=args.adam_epsilon)
+    optimizer = AdamW(model.parameters(), lr=args.learning_rate, eps=args.adam_epsilon, weight_decay=args.weight_decay)
     scheduler = get_linear_schedule_with_warmup(
         optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=t_total
     )
@@ -138,18 +140,28 @@ def train(args, train_dataset, eval_dataset, model: PreTrainedModel, tokenizer: 
     tr_loss = -1
     local_steps = -1
 
-    for _ in train_iterator:
+    scaler = GradScaler()
+
+    for num_epoch in train_iterator:
         tr_loss = 0.0
         local_steps = 0
+        report_loss = 0.0
         epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
         # all_preds = []
         # all_labels_batch = []
+
         for step, batch in enumerate(epoch_iterator):
             model.train()
-            if args.task == "generation":
-                loss = run_batch_fn_train(args, model, batch, tokenizer)
-            else:
-                loss, _, _, _ = run_batch_fn_train(args, model, batch, tokenizer)
+            # with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], profile_memory=True, record_shapes=True) as prof:
+            #     with record_function("model_inference"):
+            with autocast(dtype=torch.bfloat16):
+                if args.task == "generation":
+                    loss = run_batch_fn_train(args, model, batch, tokenizer)
+                else:
+                    loss, _, _, _ = run_batch_fn_train(args, model, batch, tokenizer)
+
+            if torch.isnan(loss):
+                print("Loss is NaN")
 
             if args.n_gpu > 1:
                 loss = loss.mean()  # mean() to average on multi-gpu parallel training
@@ -160,30 +172,57 @@ def train(args, train_dataset, eval_dataset, model: PreTrainedModel, tokenizer: 
                 with amp.scale_loss(loss, optimizer) as scaled_loss:
                     scaled_loss.backward()
             else:
-                loss.backward()
+                # loss.backward()
+                scaler.scale(loss).backward()
+
+            # print(prof.key_averages().table(sort_by="cuda_memory_usage", row_limit=10))
+            # raise RuntimeError("Stop here") 
 
             tr_loss += loss.item()
+            scaler.unscale_(optimizer)
 
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 if args.fp16:
                     torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
                 else:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                optimizer.step()
+                # optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
                 scheduler.step()
                 optimizer.zero_grad()
                 global_step += 1
                 local_steps += 1
                 epoch_iterator.set_postfix(Loss=tr_loss/local_steps)
 
+            report_loss += loss.item()
+            if (step + 1) % 2000 == 0:
+
+                results = evaluate(args, eval_dataset, model, tokenizer, run_batch_fn_eval, desc=str(global_step))
+                for key, value in results.items():
+                    wandb.log({"step": global_step,
+                            f"eval_{key}": value})
+                    
+                wandb.log({"step": global_step,
+                        "lr": scheduler.get_lr()[0],
+                        # "eval_loss": tr_loss / local_steps,
+                        "train_loss": report_loss / 2000})
+
+                report_loss = 0.0
+
         results = evaluate(args, eval_dataset, model, tokenizer, run_batch_fn_eval, desc=str(global_step))
         if args.local_rank in [-1, 0]:
             for key, value in results.items():
                 tb_writer.add_scalar("eval_{}".format(key), value, global_step)
+                wandb.log({"step": global_step,
+                        f"eval_{key}": value})
             tb_writer.add_scalar("lr", scheduler.get_lr()[0], global_step)
             tb_writer.add_scalar("loss", tr_loss / local_steps, global_step)
+            wandb.log({"step": global_step,
+                    "lr": scheduler.get_lr()[0]})
+                    # "eval_loss": tr_loss / local_steps})
 
-            checkpoint_prefix = "checkpoint"
+            checkpoint_prefix = f"checkpoint-{args.run_name}"
             # Save model checkpoint
             output_dir = os.path.join(args.output_dir, "{}-{}".format(checkpoint_prefix, global_step))
             os.makedirs(output_dir, exist_ok=True)
@@ -242,6 +281,7 @@ def evaluate(args, eval_dataset, model: PreTrainedModel, tokenizer: PreTrainedTo
     cur_head_id = -1
     cur_gen_beam = []
     cur_refs = []
+    tr_loss = 0.0
 
     model.eval()
     for batch in tqdm(eval_dataloader, desc="Evaluating", disable=args.local_rank not in [-1, 0]):
@@ -274,10 +314,11 @@ def evaluate(args, eval_dataset, model: PreTrainedModel, tokenizer: PreTrainedTo
 
                     cur_refs.append(truth_text[batch_id])
             else:
-                _, _, mc_logits, mc_labels = run_batch_fn(args, model, batch, tokenizer)
+                loss, _, mc_logits, mc_labels = run_batch_fn(args, model, batch, tokenizer)
                 data_infos.append(batch[-1])
                 all_preds.append(mc_logits.detach().cpu().numpy())
                 all_labels.append(mc_labels.detach().cpu().numpy())
+                tr_loss += loss.item()
 
     if args.task == "generation":
         if len(cur_refs) > 0:
@@ -311,8 +352,7 @@ def evaluate(args, eval_dataset, model: PreTrainedModel, tokenizer: PreTrainedTo
         precision = precision_score(all_labels, all_pred_ids)
         recall = recall_score(all_labels, all_pred_ids)
         f1 = 2.0 / ((1.0 / precision) + (1.0 / recall))
-        result = {"accuracy": accuracy, "precision": precision, "recall": recall, "f1": f1}
-        print(result)
+        result = {"accuracy": accuracy, "precision": precision, "recall": recall, "f1": f1, "loss": tr_loss / len(eval_dataloader)}
         if args.output_file:
             write_linking_preds(args.output_file, data_infos, all_pred_ids, all_pred_scores)
 
@@ -355,7 +395,7 @@ def main():
                         help="Optional description to be listed in eval_results.txt")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu",
                         help="Device (cuda or cpu)")
-    parser.add_argument("--local_rank", type=int, default=-1,
+    parser.add_argument("--local-rank", type=int, default=-1,
                         help="Local rank for distributed training (-1: not distributed)")
     args = parser.parse_args()
 
@@ -366,6 +406,7 @@ def main():
         level=logging.INFO if args.local_rank in [-1, 0] else logging.WARN,
     )
 
+    args.local_rank = -1
     verify_args(args, parser)
 
     # load args from params file and update the args Namespace
@@ -385,6 +426,10 @@ def main():
     dataset_args.task = args.task
     dataset_args.model_name_or_path = args.model_name_or_path
     dataset_args.window = args.dataroot.split("/")[3]
+
+    wandb.init(project="Comfact",
+               config=params)
+    args.run_name = wandb.run.name
 
     # Setup CUDA, GPU & distributed training
     args.distributed = (args.local_rank != -1)
@@ -418,13 +463,28 @@ def main():
         model.resize_token_embeddings(len(tokenizer))
 
     model.to(args.device)
+    for name, param in model.named_parameters():
+        if name.startswith('deberta.encoder.layer') and int(name.split('.')[3]) < params["num_frozen_layers"]:
+            param.requires_grad = False
+        elif name.startswith('deberta.embeddings'):
+            param.requires_grad = False
+
+    for i in range(params["num_frozen_layers"], 12):
+        model.deberta.encoder.layer[i].output.dropout.drop_prob = args.dropout
+        model.deberta.encoder.layer[i].attention.self.dropout.drop_prob = args.dropout
+        model.deberta.encoder.layer[i].attention.output.dropout.drop_prob = args.dropout
+
+    # for name, param in model.named_parameters():
+    #     print(name, param.requires_grad)
 
     if args.local_rank == 0:
         torch.distributed.barrier()  # End of barrier to make sure only the first process in distributed training download model & vocab
 
     logger.info("Training/evaluation parameters %s", args)
     if not args.eval_only:
-        train_dataset = dataset_class_train(dataset_args, tokenizer, split_type="train")
+        if args.oversample is None:
+            args.oversample = False
+        train_dataset = dataset_class_train(dataset_args, tokenizer, split_type="train", oversample=args.oversample)
         eval_dataset = dataset_class_eval(dataset_args, tokenizer, split_type=args.eval_dataset)
 
         global_step, tr_loss = train(args, train_dataset, eval_dataset, model, tokenizer, run_batch_fn_train, run_batch_fn_eval)

@@ -22,14 +22,16 @@ SPECIAL_TOKENS = {
 SPECIAL_TOKENS_VALUES = ["<c_sep>", "<f_sep>", "<p_b>", "<u_b>", "<f_b>"]
 ADD_TOKENS_VALUES = ["[FSEP]"]
 
+random.seed(42)
 
 class BaseDataset(torch.utils.data.Dataset):
-    def __init__(self, args, tokenizer, split_type, labels=True, labels_file=None):
+    def __init__(self, args, tokenizer, split_type, labels=True, labels_file=None, oversample=False):
         self.args = args
         self.dataroot = args.dataroot
         self.tokenizer = tokenizer
         self.split_type = split_type
         self.task_type = args.task
+        self.oversample = oversample
 
         self.SPECIAL_TOKENS = SPECIAL_TOKENS
         self.SPECIAL_TOKENS_VALUES = SPECIAL_TOKENS_VALUES
@@ -70,6 +72,16 @@ class BaseDataset(torch.utils.data.Dataset):
             sample["text"] = log["text"]
             sample["label"] = label
             samples.append(deepcopy(sample))
+
+        if self.oversample:
+            # oversample postive samples
+            positive_samples = [sample for sample in samples if sample["label"]["target"]]
+            negative_samples = [sample for sample in samples if not sample["label"]["target"]]
+            samples = (positive_samples * 2) + negative_samples
+
+        random.shuffle(samples)
+        samples = [sample for sample in samples]
+
         return samples
 
     def _create_examples(self):
@@ -220,8 +232,8 @@ class BaseDataset(torch.utils.data.Dataset):
 
 
 class FactLinkingDataset(BaseDataset):
-    def __init__(self, args, tokenizer, split_type, labels=True, labels_file=None):
-        super(FactLinkingDataset, self).__init__(args, tokenizer, split_type, labels, labels_file)
+    def __init__(self, args, tokenizer, split_type, labels=True, labels_file=None, oversample=False):
+        super(FactLinkingDataset, self).__init__(args, tokenizer, split_type, labels, labels_file, oversample)
 
     def __getitem__(self, index):
         example = deepcopy(self.examples[index])
@@ -260,8 +272,8 @@ class FactLinkingDataset(BaseDataset):
 
 
 class FactGenerationDataset(BaseDataset):
-    def __init__(self, args, tokenizer, split_type, labels=True, labels_file=None):
-        super(FactGenerationDataset, self).__init__(args, tokenizer, split_type, labels, labels_file)
+    def __init__(self, args, tokenizer, split_type, labels=True, labels_file=None, oversample=False):
+        super(FactGenerationDataset, self).__init__(args, tokenizer, split_type, labels, labels_file, oversample=oversample)
 
     def __getitem__(self, index):
         example = deepcopy(self.examples[index])

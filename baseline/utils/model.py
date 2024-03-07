@@ -18,8 +18,12 @@ def run_batch_linking(args, model, batch, tokenizer=None):
 
     model_outputs = model(input_ids=input_ids, labels=labels)
 
-    cls_loss = model_outputs[0]
-    cls_logits = model_outputs[1]
+    if args.fp16:
+        cls_loss = model_outputs["loss"]
+        cls_logits = model_outputs["logits"]
+    else:
+        cls_loss = model_outputs[0]
+        cls_logits = model_outputs[1]
     lm_logits = None
 
     return cls_loss, lm_logits, cls_logits, labels
